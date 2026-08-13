@@ -45,12 +45,20 @@ def post():
 	}).insert(ignore_permissions=True)
 
 	messages = []
+	message_echoes = []
 	phone_id = None
 	try:
-		messages = data["entry"][0]["changes"][0]["value"].get("messages", [])
-		phone_id = data.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}).get("metadata", {}).get("phone_number_id")
+		value = data["entry"][0]["changes"][0]["value"]
+		messages = value.get("messages", [])
+		# Coexistence: messages the owner sends from the WhatsApp Business app on
+		# the phone arrive as echoes. Observed wire key is `message_echoes`
+		# (Meta's docs call the subscription field `smb_message_echoes`).
+		message_echoes = value.get("message_echoes", [])
+		phone_id = value.get("metadata", {}).get("phone_number_id")
 	except KeyError:
-		messages = data["entry"]["changes"][0]["value"].get("messages", [])
+		value = data["entry"]["changes"][0]["value"]
+		messages = value.get("messages", [])
+		message_echoes = value.get("message_echoes", [])
 	sender_profile_name = next(
 		(
 			contact.get("profile", {}).get("name")
@@ -69,8 +77,11 @@ def post():
 	# for them by design. Gating the entire handler on `whatsapp_account`
 	# silently drops every template-status update; gate only the message-
 	# ingestion branch instead.
-	if messages and not whatsapp_account:
+	if (messages or message_echoes) and not whatsapp_account:
 		return
+
+	for echo in message_echoes:
+		create_echo_message(echo, whatsapp_account)
 
 	if messages:
 		for message in messages:
@@ -276,6 +287,38 @@ def post():
 		update_status(changes)
 	return
 
+def create_echo_message(echo, whatsapp_account):
+	"""Record a coexistence echo: a message the owner sent from the WhatsApp
+	Business app on the phone. type=Outgoing + via_phone=1 (which suppresses the
+	controller's send path — the message already went out through the phone).
+
+	Meta redelivers webhooks on retry, so dedupe on message_id.
+	Media echoes are recorded with caption + content_type only (no media download
+	in v1 — echoes carry a media id whose download semantics differ per provider).
+	"""
+	echo_type = echo.get("type", "text")
+	if frappe.db.exists("WhatsApp Message", {"message_id": echo.get("id")}):
+		return
+	if echo_type == "text":
+		body = echo.get("text", {}).get("body", "")
+	elif echo_type in ("image", "audio", "video", "document", "sticker"):
+		body = echo.get(echo_type, {}).get("caption", "") or f"[{echo_type} sent from phone]"
+	else:
+		payload = echo.get(echo_type)
+		body = json.dumps(payload) if isinstance(payload, (dict, list)) else str(payload or f"[{echo_type}]")
+	frappe.get_doc({
+		"doctype": "WhatsApp Message",
+		"type": "Outgoing",
+		"via_phone": 1,
+		"to": echo.get("to"),
+		"message": body,
+		"message_id": echo.get("id"),
+		"content_type": echo_type if echo_type in ("text", "image", "audio", "video", "document", "flow") else "text",
+		"status": "sent",
+		"whatsapp_account": whatsapp_account.name,
+	}).insert(ignore_permissions=True)
+
+
 def update_status(data):
 	"""Update status hook."""
 	if data.get("field") == "message_template_status_update":
@@ -299,6 +342,12 @@ def update_message_status(data):
 	status = data['statuses'][0]['status']
 	conversation = data['statuses'][0].get('conversation', {}).get('id')
 	name = frappe.db.get_value("WhatsApp Message", filters={"message_id": id})
+
+	# Status callbacks can reference messages we hold no row for (sent before this
+	# app was installed, echo-status races, other integrations on the same number).
+	# Crashing here 500s the webhook and puts Meta into a retry storm — skip instead.
+	if not name:
+		return
 
 	doc = frappe.get_doc("WhatsApp Message", name)
 	doc.status = status

@@ -42,7 +42,8 @@
   "reference_doctype",
   "bulk_message_reference",
   "column_break_efrb",
-  "reference_name"
+  "reference_name",
+  "via_phone"
  ],
  "fields": [
   {
@@ -276,6 +277,13 @@
    "fieldtype": "JSON",
    "label": "Product Catalog",
    "set_only_once": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "via_phone",
+   "fieldtype": "Check",
+   "label": "Sent From Phone (Coexistence Echo)",
+   "read_only": 1
   }
  ],
  "index_web_pages_for_search": 1,

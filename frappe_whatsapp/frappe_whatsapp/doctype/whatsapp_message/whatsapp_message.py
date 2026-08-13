@@ -15,6 +15,23 @@ class WhatsAppMessage(Document):
     def on_update(self):
         self.update_profile_name()
 
+    def after_insert(self):
+        # Realtime signal for chat UIs (site-wide fan-out, same pattern as the
+        # flow-response event). DB row is the state; this is just the signal.
+        frappe.publish_realtime(  # nosemgrep: frappe-realtime-pick-room
+            "whatsapp_message_new",
+            {
+                "name": self.name,
+                "type": self.type,
+                "from": self.get("from"),
+                "to": self.to,
+                "message": self.message,
+                "content_type": self.content_type,
+                "via_phone": bool(self.get("via_phone")),
+                "whatsapp_account": self.whatsapp_account,
+            },
+        )
+
     def update_profile_name(self):
         number = self.get("from")
         if not number:
@@ -70,6 +87,11 @@ class WhatsAppMessage(Document):
         on template sends, `send_template` -> `notify` raises on error.
         """
         if self.type != "Outgoing":
+            return
+
+        # Coexistence echo: the message was ALREADY sent by the owner from the
+        # WhatsApp Business app on the phone; this row only records it. Never re-send.
+        if self.get("via_phone"):
             return
 
         if self.message_type != "Template":
