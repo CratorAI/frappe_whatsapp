@@ -20,7 +20,8 @@
   "business_id",
   "is_default_incoming",
   "is_default_outgoing",
-  "allow_auto_read_receipt"
+  "allow_auto_read_receipt",
+  "inbound_secret"
  ],
  "fields": [
   {
@@ -100,6 +101,12 @@
    "fieldname": "allow_auto_read_receipt",
    "fieldtype": "Check",
    "label": "Allow auto read receipt"
+  },
+  {
+   "fieldname": "inbound_secret",
+   "fieldtype": "Password",
+   "label": "Inbound Webhook Secret",
+   "description": "When set, webhook POSTs must carry ?secret=<value> in the callback URL. Register the webhook as .../webhook?secret=<value>."
   }
  ],
  "grid_page_length": 50,

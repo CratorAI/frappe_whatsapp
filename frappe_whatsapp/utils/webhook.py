@@ -13,9 +13,43 @@ from frappe_whatsapp.utils import get_whatsapp_account
 @frappe.whitelist(allow_guest=True)
 def webhook():
 	"""Meta webhook."""
+	require_inbound_secret()
 	if frappe.request.method == "GET":
 		return get()
 	return post()
+
+
+def require_inbound_secret():
+	"""Site-level inbound auth for the guest webhook.
+
+	When the site cannot validate Meta's X-Hub-Signature-256 (e.g. the WABA lives
+	under a relay provider's Meta app, so we never hold the app secret), the only
+	caller authentication available is a secret embedded in the registered callback
+	URL: .../webhook?secret=<value>. Meta and Graph-compatible relays call the
+	registered URL verbatim (query string preserved, on the verification GET too).
+
+	Enforcement: if ANY WhatsApp Account defines an Inbound Webhook Secret, every
+	request must present a secret matching one of them. Sites with no secrets
+	configured behave exactly as upstream (no check).
+	"""
+	import hmac
+
+	accounts = frappe.get_all("WhatsApp Account", pluck="name")
+	secrets = []
+	for name in accounts:
+		try:
+			value = frappe.utils.password.get_decrypted_password(
+				"WhatsApp Account", name, "inbound_secret", raise_exception=False
+			)
+		except Exception:
+			value = None
+		if value:
+			secrets.append(value)
+	if not secrets:
+		return
+	presented = frappe.form_dict.get("secret") or frappe.request.args.get("secret") or ""
+	if not any(hmac.compare_digest(presented, s) for s in secrets):
+		frappe.throw("Invalid webhook secret", frappe.PermissionError)
 
 
 def get():
@@ -82,6 +116,16 @@ def post():
 
 	for echo in message_echoes:
 		create_echo_message(echo, whatsapp_account)
+
+	# Coexistence chat-history sync: delivered once around QR onboarding as `history`
+	# chunks. Parsed defensively — the raw payload is already in WhatsApp Notification
+	# Log (inserted above), so anything this parser skips remains recoverable.
+	history_chunks = value.get("history") if isinstance(value, dict) else None
+	if history_chunks:
+		account = whatsapp_account or get_whatsapp_account(account_type="incoming")
+		business_number = (value.get("metadata") or {}).get("display_phone_number", "")
+		if account:
+			import_history_chunks(history_chunks, account, business_number)
 
 	if messages:
 		for message in messages:
@@ -286,6 +330,68 @@ def post():
 			changes = data["entry"]["changes"][0]
 		update_status(changes)
 	return
+
+def import_history_chunks(chunks, whatsapp_account, business_number):
+	"""Import coexistence history-sync chunks into WhatsApp Message rows.
+
+	Per-message isolation: one malformed entry must not 500 the whole chunk (Meta
+	redelivers the entire webhook on non-200, which would loop the batch forever).
+	Original send time is preserved onto `creation` so threads keep true chronology.
+	Direction: `from` == the business number → Outgoing via_phone; else Incoming.
+	"""
+	import datetime
+
+	if not isinstance(chunks, list):
+		chunks = [chunks]
+	imported = skipped = failed = 0
+	for chunk in chunks:
+		threads = (chunk or {}).get("threads") or []
+		for thread in threads:
+			counterparty = str(thread.get("id") or "")
+			for msg in thread.get("messages") or []:
+				try:
+					msg_id = msg.get("id")
+					if not msg_id or frappe.db.exists("WhatsApp Message", {"message_id": msg_id}):
+						skipped += 1
+						continue
+					sender = str(msg.get("from") or "")
+					outgoing = business_number and sender.endswith(business_number[-8:])
+					msg_type = msg.get("type", "text")
+					if msg_type == "text":
+						body = (msg.get("text") or {}).get("body", "")
+					elif msg_type in ("image", "audio", "video", "document", "sticker"):
+						body = (msg.get(msg_type) or {}).get("caption", "") or f"[{msg_type}]"
+					else:
+						payload = msg.get(msg_type)
+						body = json.dumps(payload) if isinstance(payload, (dict, list)) else str(payload or f"[{msg_type}]")
+					doc = frappe.get_doc({
+						"doctype": "WhatsApp Message",
+						"type": "Outgoing" if outgoing else "Incoming",
+						"via_phone": 1 if outgoing else 0,
+						"to": (counterparty or msg.get("to")) if outgoing else None,
+						"from": None if outgoing else (sender or counterparty),
+						"message": body,
+						"message_id": msg_id,
+						"content_type": msg_type if msg_type in ("text", "image", "audio", "video", "document", "flow") else "text",
+						"status": "delivered" if outgoing else None,
+						"whatsapp_account": whatsapp_account.name,
+					})
+					doc.insert(ignore_permissions=True)
+					ts = msg.get("timestamp")
+					if ts:
+						original = datetime.datetime.utcfromtimestamp(int(ts))
+						frappe.db.set_value(
+							"WhatsApp Message", doc.name, "creation", original,
+							update_modified=False,
+						)
+					imported += 1
+				except Exception:
+					failed += 1
+					frappe.log_error(title="WhatsApp history import: message skipped")
+	frappe.logger("frappe_whatsapp").info(
+		f"history import: {imported} imported, {skipped} skipped (dupes), {failed} failed"
+	)
+
 
 def create_echo_message(echo, whatsapp_account):
 	"""Record a coexistence echo: a message the owner sent from the WhatsApp
