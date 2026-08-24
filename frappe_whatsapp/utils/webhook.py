@@ -47,7 +47,14 @@ def require_inbound_secret():
 			secrets.append(value)
 	if not secrets:
 		return
-	presented = frappe.form_dict.get("secret") or frappe.request.args.get("secret") or ""
+	# Read the secret from the URL QUERY STRING ONLY. frappe.form_dict merges POST body
+	# fields, so a caller whose body happens to contain a "secret" key (relay-provider
+	# verification probes do) would SHADOW the URL secret and fail the comparison.
+	presented = ""
+	if getattr(frappe.request, "args", None) is not None:
+		presented = frappe.request.args.get("secret") or ""
+	if not presented:
+		presented = frappe.form_dict.get("secret") or ""
 	if not any(hmac.compare_digest(presented, s) for s in secrets):
 		frappe.throw("Invalid webhook secret", frappe.PermissionError)
 
@@ -81,6 +88,7 @@ def post():
 	messages = []
 	message_echoes = []
 	phone_id = None
+	value = {}
 	try:
 		value = data["entry"][0]["changes"][0]["value"]
 		messages = value.get("messages", [])
@@ -90,9 +98,18 @@ def post():
 		message_echoes = value.get("message_echoes", [])
 		phone_id = value.get("metadata", {}).get("phone_number_id")
 	except KeyError:
-		value = data["entry"]["changes"][0]["value"]
-		messages = value.get("messages", [])
-		message_echoes = value.get("message_echoes", [])
+		try:
+			value = data["entry"]["changes"][0]["value"]
+			messages = value.get("messages", [])
+			message_echoes = value.get("message_echoes", [])
+		except (KeyError, TypeError, IndexError):
+			# Not a Meta event envelope at all — relay-provider verification probes and
+			# health checks POST arbitrary bodies. The raw payload is already in
+			# WhatsApp Notification Log (above); acknowledge instead of 500ing, so
+			# provider preflights pass and Meta never enters a redelivery loop.
+			return
+	except (TypeError, IndexError):
+		return
 	sender_profile_name = next(
 		(
 			contact.get("profile", {}).get("name")
