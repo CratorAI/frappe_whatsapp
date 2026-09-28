@@ -177,7 +177,11 @@ def get_whatsapp_account(phone_id=None, account_type='incoming'):
     return None
 
 def format_number(number):
-    """Format number."""
+    """Format number. Returns None for a missing number rather than raising — a
+    username-only WhatsApp user has no phone number at all."""
+    if not number:
+        return None
+    number = str(number)
     if number.startswith("+"):
         number = number[1 : len(number)]
 

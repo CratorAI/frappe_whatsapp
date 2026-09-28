@@ -3,6 +3,7 @@ import frappe
 import json
 import requests
 import time
+import traceback
 from frappe import _
 from werkzeug.wrappers import Response
 import frappe.utils
@@ -146,198 +147,17 @@ def post():
 
 	if messages:
 		for message in messages:
-			message_type = message['type']
-			is_reply = True if message.get('context') and 'forwarded' not in message.get('context') else False
-			reply_to_message_id = message['context']['id'] if is_reply else None
-			if message_type == 'text':
-				frappe.get_doc({
-					"doctype": "WhatsApp Message",
-					"type": "Incoming",
-					"from": message['from'],
-					"message": message['text']['body'],
-					"message_id": message['id'],
-					"reply_to_message_id": reply_to_message_id,
-					"is_reply": is_reply,
-					"content_type":message_type,
-					"profile_name":sender_profile_name,
-					"whatsapp_account":whatsapp_account.name
-				}).insert(ignore_permissions=True)
-			elif message_type == 'reaction':
-				frappe.get_doc({
-					"doctype": "WhatsApp Message",
-					"type": "Incoming",
-					"from": message['from'],
-					"message": message['reaction']['emoji'],
-					"reply_to_message_id": message['reaction']['message_id'],
-					"message_id": message['id'],
-					"content_type": "reaction",
-					"profile_name":sender_profile_name,
-					"whatsapp_account":whatsapp_account.name
-				}).insert(ignore_permissions=True)
-			elif message_type == 'interactive':
-				interactive_data = message['interactive']
-				interactive_type = interactive_data.get('type')
-
-				# Handle button reply
-				if interactive_type == 'button_reply':
-					frappe.get_doc({
-						"doctype": "WhatsApp Message",
-						"type": "Incoming",
-						"from": message['from'],
-						"message": interactive_data['button_reply']['id'],
-						"message_id": message['id'],
-						"reply_to_message_id": reply_to_message_id,
-						"is_reply": is_reply,
-						"content_type": "button",
-						"profile_name": sender_profile_name,
-						"whatsapp_account": whatsapp_account.name
-					}).insert(ignore_permissions=True)
-				# Handle list reply
-				elif interactive_type == 'list_reply':
-					frappe.get_doc({
-						"doctype": "WhatsApp Message",
-						"type": "Incoming",
-						"from": message['from'],
-						"message": interactive_data['list_reply']['id'],
-						"message_id": message['id'],
-						"reply_to_message_id": reply_to_message_id,
-						"is_reply": is_reply,
-						"content_type": "button",
-						"profile_name": sender_profile_name,
-						"whatsapp_account": whatsapp_account.name
-					}).insert(ignore_permissions=True)
-				# Handle WhatsApp Flows (nfm_reply)
-				elif interactive_type == 'nfm_reply':
-					nfm_reply = interactive_data['nfm_reply']
-					response_json_str = nfm_reply.get('response_json', '{}')
-
-					# Parse the response JSON
-					try:
-						flow_response = json.loads(response_json_str)
-					except json.JSONDecodeError:
-						flow_response = {}
-
-					# Create a summary message from the flow response
-					summary_parts = []
-					for key, value in flow_response.items():
-						if value:
-							summary_parts.append(f"{key}: {value}")
-					summary_message = ", ".join(summary_parts) if summary_parts else "Flow completed"
-
-					msg_doc = frappe.get_doc({
-						"doctype": "WhatsApp Message",
-						"type": "Incoming",
-						"from": message['from'],
-						"message": summary_message,
-						"message_id": message['id'],
-						"reply_to_message_id": reply_to_message_id,
-						"is_reply": is_reply,
-						"content_type": "flow",
-						"flow_response": json.dumps(flow_response),
-						"profile_name": sender_profile_name,
-						"whatsapp_account": whatsapp_account.name
-					}).insert(ignore_permissions=True)
-
-					# Publish realtime event for flow response
-					frappe.publish_realtime(  # nosemgrep: frappe-realtime-pick-room -- intentional site-wide fan-out for chat UIs (whatsapp_chat companion app) listening for inbound flow responses
-						"whatsapp_flow_response",
-						{
-							"phone": message['from'],
-							"message_id": message['id'],
-							"flow_response": flow_response,
-							"whatsapp_account": whatsapp_account.name
-						}
-					)
-			# NEW: Handle Shopping Cart / Orders from MPM
-			elif message_type == 'order':
-				order_data = message['order']
-
-				# Inject the raw data into product_catalog_json
-				frappe.get_doc({
-					"doctype": "WhatsApp Message",
-					"type": "Incoming",
-					"from": message['from'],
-					"message": _("New Order Received via WhatsApp"),
-					"message_id": message['id'],
-					"content_type": "order",
-					"profile_name": sender_profile_name,
-					"whatsapp_account": whatsapp_account.name,
-					"product_catalog_json": json.dumps(order_data)
-				}).insert(ignore_permissions=True)
-			elif message_type in ["image", "audio", "video", "document"]:
-				token = whatsapp_account.get_password("token")
-				url = f"{whatsapp_account.url}/{whatsapp_account.version}/"
-
-				media_id = message[message_type]["id"]
-				headers = {
-					'Authorization': 'Bearer ' + token
-
-				}
-				response = requests.get(f'{url}{media_id}/', headers=headers)
-
-				if response.status_code == 200:
-					media_data = response.json()
-					media_url = media_data.get("url")
-					mime_type = media_data.get("mime_type")
-					file_extension = mime_type.split('/')[1]
-
-					media_response = requests.get(media_url, headers=headers)
-					if media_response.status_code == 200:
-
-						file_data = media_response.content
-						file_name = f"{frappe.generate_hash(length=10)}.{file_extension}"
-
-						message_doc = frappe.get_doc({
-							"doctype": "WhatsApp Message",
-							"type": "Incoming",
-							"from": message['from'],
-							"message_id": message['id'],
-							"reply_to_message_id": reply_to_message_id,
-							"is_reply": is_reply,
-							"message": message[message_type].get("caption", ""),
-							"content_type" : message_type,
-							"profile_name":sender_profile_name,
-							"whatsapp_account":whatsapp_account.name
-						}).insert(ignore_permissions=True)
-
-						file = frappe.get_doc(
-							{
-								"doctype": "File",
-								"file_name": file_name,
-								"attached_to_doctype": "WhatsApp Message",
-								"attached_to_name": message_doc.name,
-								"content": file_data,
-								"attached_to_field": "attach"
-							}
-						).save(ignore_permissions=True)
-
-
-						message_doc.attach = file.file_url
-						message_doc.save()
-			elif message_type == "button":
-				frappe.get_doc({
-					"doctype": "WhatsApp Message",
-					"type": "Incoming",
-					"from": message['from'],
-					"message": message['button']['text'],
-					"message_id": message['id'],
-					"reply_to_message_id": reply_to_message_id,
-					"is_reply": is_reply,
-					"content_type": message_type,
-					"profile_name":sender_profile_name,
-					"whatsapp_account":whatsapp_account.name
-				}).insert(ignore_permissions=True)
-			else:
-				frappe.get_doc({
-					"doctype": "WhatsApp Message",
-					"type": "Incoming",
-					"from": message['from'],
-					"message_id": message['id'],
-					"message": message[message_type].get(message_type),
-					"content_type" : message_type,
-					"profile_name":sender_profile_name,
-					"whatsapp_account":whatsapp_account.name
-				}).insert(ignore_permissions=True)
+			# Per-message isolation. One unhandled payload used to raise out of the
+			# webhook, which (a) 500'd the whole batch so Meta redelivered it forever,
+			# (b) dropped every other message in the same delivery, and (c) rolled back
+			# the WhatsApp Notification Log row written above — destroying the only
+			# copy of the raw payload. Now a bad message is logged and skipped alone.
+			frappe.db.savepoint("wa_inbound_message")
+			try:
+				ingest_incoming_message(message, whatsapp_account, sender_profile_name)
+			except Exception:
+				frappe.db.rollback(save_point="wa_inbound_message")
+				log_webhook_failure("WhatsApp inbound message failed", message)
 
 	else:
 		changes = None
@@ -347,6 +167,271 @@ def post():
 			changes = data["entry"]["changes"][0]
 		update_status(changes)
 	return
+
+# Options of WhatsApp Message.content_type. Anything else must be mapped onto one of
+# these before insert, or the Select validation throws and the message is lost.
+CONTENT_TYPES = (
+	"text", "document", "image", "video", "audio", "flow", "reaction",
+	"location", "contact", "button", "interactive", "order",
+)
+MEDIA_TYPES = ("image", "audio", "video", "document", "sticker")
+
+
+def sender_of(message):
+	"""The customer's identity. Username-only WhatsApp users (no phone number on the
+	account) arrive with `from_user_id` and NO `from` key — indexing `message['from']`
+	raised KeyError and silently lost their messages."""
+	return message.get("from") or message.get("from_user_id")
+
+
+def log_webhook_failure(title, payload, detail=None):
+	"""Log without Frappe's traceback-with-variables. That dump captures the request
+	object, whose URL carries the ?secret= used to authenticate this guest endpoint —
+	so every crash was writing the live webhook secret into Error Log."""
+	body = detail or traceback.format_exc()
+	try:
+		summary = json.dumps(payload, default=str)[:3000]
+	except Exception:
+		summary = str(payload)[:3000]
+	frappe.log_error(title=title, message=f"{body}\n\npayload:\n{summary}")
+
+
+def ingest_incoming_message(message, whatsapp_account, sender_profile_name):
+	"""Record one inbound message. Raises on genuinely malformed payloads; the caller
+	isolates each message in its own savepoint."""
+	message_type = message.get("type")
+	message_id = message.get("id")
+
+	# Meta redelivers a webhook until it gets a 200, so a delivery that previously
+	# failed can arrive again. The echo path already dedupes; inbound now does too.
+	if message_id and frappe.db.exists("WhatsApp Message", {"message_id": message_id}):
+		return
+
+	sender = sender_of(message)
+	context = message.get("context") or {}
+	is_reply = True if context and "forwarded" not in context else False
+	reply_to_message_id = context.get("id") if is_reply else None
+
+	def insert(**fields):
+		doc = {
+			"doctype": "WhatsApp Message",
+			"type": "Incoming",
+			"from": sender,
+			"message_id": message_id,
+			"profile_name": sender_profile_name,
+			"whatsapp_account": whatsapp_account.name,
+		}
+		doc.update(fields)
+		return frappe.get_doc(doc).insert(ignore_permissions=True)
+
+	if message_type == "text":
+		insert(
+			message=message["text"]["body"],
+			reply_to_message_id=reply_to_message_id,
+			is_reply=is_reply,
+			content_type="text",
+		)
+
+	elif message_type == "reaction":
+		reaction = message.get("reaction") or {}
+		# A reaction with no emoji is the customer REMOVING their reaction. Nothing to
+		# record — and indexing ['emoji'] used to raise.
+		if not reaction.get("emoji"):
+			return
+		insert(
+			message=reaction["emoji"],
+			reply_to_message_id=reaction.get("message_id"),
+			content_type="reaction",
+		)
+
+	elif message_type == "interactive":
+		interactive_data = message["interactive"]
+		interactive_type = interactive_data.get("type")
+		if interactive_type == "button_reply":
+			insert(
+				message=interactive_data["button_reply"]["id"],
+				reply_to_message_id=reply_to_message_id,
+				is_reply=is_reply,
+				content_type="button",
+			)
+		elif interactive_type == "list_reply":
+			insert(
+				message=interactive_data["list_reply"]["id"],
+				reply_to_message_id=reply_to_message_id,
+				is_reply=is_reply,
+				content_type="button",
+			)
+		elif interactive_type == "nfm_reply":
+			nfm_reply = interactive_data["nfm_reply"]
+			try:
+				flow_response = json.loads(nfm_reply.get("response_json", "{}"))
+			except json.JSONDecodeError:
+				flow_response = {}
+			summary_parts = [f"{key}: {value}" for key, value in flow_response.items() if value]
+			insert(
+				message=", ".join(summary_parts) if summary_parts else "Flow completed",
+				reply_to_message_id=reply_to_message_id,
+				is_reply=is_reply,
+				content_type="flow",
+				flow_response=json.dumps(flow_response),
+			)
+			frappe.publish_realtime(  # nosemgrep: frappe-realtime-pick-room -- intentional site-wide fan-out for chat UIs (whatsapp_chat companion app) listening for inbound flow responses
+				"whatsapp_flow_response",
+				{
+					"phone": sender,
+					"message_id": message_id,
+					"flow_response": flow_response,
+					"whatsapp_account": whatsapp_account.name,
+				},
+			)
+
+	elif message_type == "order":
+		insert(
+			message=_("New Order Received via WhatsApp"),
+			content_type="order",
+			product_catalog_json=json.dumps(message["order"]),
+		)
+
+	elif message_type in MEDIA_TYPES:
+		ingest_incoming_media(message, message_type, insert, reply_to_message_id, is_reply, whatsapp_account)
+
+	elif message_type == "button":
+		insert(
+			message=message["button"]["text"],
+			reply_to_message_id=reply_to_message_id,
+			is_reply=is_reply,
+			content_type="button",
+		)
+
+	elif message_type == "edit":
+		# The customer edited a message they already sent. Update that message in
+		# place rather than recording the edit as a separate new message.
+		edit = message.get("edit") or {}
+		new_message = edit.get("message") or {}
+		new_text = (new_message.get("text") or {}).get("body")
+		if new_text is None:
+			new_text = f"[edited {new_message.get('type') or 'message'}]"
+		original = frappe.db.get_value(
+			"WhatsApp Message", {"message_id": edit.get("original_message_id")}, "name"
+		)
+		if original:
+			frappe.db.set_value("WhatsApp Message", original, "message", f"{new_text} (edited)")
+		else:
+			insert(message=f"{new_text} (edited)", content_type="text")
+
+	elif message_type == "revoke":
+		# The customer deleted a message on WhatsApp. The copy already recorded here is
+		# kept as-is (it is the business's record of what was received); nothing new
+		# to insert.
+		return
+
+	elif message_type == "unsupported":
+		insert(
+			message="[Unsupported message type — open it on the phone]",
+			content_type="text",
+		)
+
+	else:
+		payload = message.get(message_type)
+		body = json.dumps(payload) if isinstance(payload, (dict, list)) else str(payload or f"[{message_type}]")
+		insert(
+			message=body,
+			content_type=message_type if message_type in CONTENT_TYPES else "text",
+		)
+
+
+def ingest_incoming_media(message, message_type, insert, reply_to_message_id, is_reply, whatsapp_account):
+	"""Record an inbound image/audio/video/document/sticker.
+
+	The message is saved FIRST, then the file is fetched. Previously both media-API
+	calls had to return 200 before anything was written, with no else branch — so any
+	download failure discarded the message, its caption and every trace of it. Not a
+	single inbound media message had ever reached this site.
+	"""
+	media = message.get(message_type) or {}
+	caption = media.get("caption", "")
+	if not caption and message_type == "sticker":
+		caption = "[sticker]"
+	doc = insert(
+		message=caption,
+		reply_to_message_id=reply_to_message_id,
+		is_reply=is_reply,
+		# Stickers are webp images; content_type has no sticker option.
+		content_type="image" if message_type == "sticker" else message_type,
+	)
+
+	file_data, file_extension, failure = download_inbound_media(media, whatsapp_account)
+	if failure:
+		if not caption:
+			doc.db_set("message", f"[{message_type} received — could not be downloaded]")
+		log_webhook_failure(
+			"WhatsApp inbound media download failed",
+			{
+				"message_id": message.get("id"),
+				"type": message_type,
+				"media_id": media.get("id"),
+				"mime_type": media.get("mime_type"),
+				# Whether the payload itself carried a direct download link — the
+				# deciding fact for how downloads should be fetched.
+				"payload_has_url": bool(media.get("url")),
+			},
+			detail=failure,
+		)
+		return
+
+	file = frappe.get_doc({
+		"doctype": "File",
+		"file_name": f"{frappe.generate_hash(length=10)}.{file_extension}",
+		"attached_to_doctype": "WhatsApp Message",
+		"attached_to_name": doc.name,
+		"content": file_data,
+		"attached_to_field": "attach",
+	}).save(ignore_permissions=True)
+	doc.db_set("attach", file.file_url)
+
+
+def download_inbound_media(media, whatsapp_account):
+	"""Fetch an inbound media file. Returns (bytes, extension, None) on success or
+	(None, None, reason) on failure — never raises, and the reason records the exact
+	HTTP status and response so a failure can be diagnosed from Error Log."""
+	media_id = media.get("id")
+	if not media_id:
+		return None, None, "payload carried no media id"
+	token = whatsapp_account.get_password("token")
+	headers = {"Authorization": "Bearer " + token}
+	lookup_url = f"{whatsapp_account.url}/{whatsapp_account.version}/{media_id}/"
+
+	try:
+		response = requests.get(lookup_url, headers=headers, timeout=30)
+	except requests.RequestException as e:
+		return None, None, f"media lookup request failed: {lookup_url}: {e!r}"
+	if response.status_code != 200:
+		return None, None, (
+			f"media lookup returned HTTP {response.status_code} from {lookup_url}\n"
+			f"body: {response.text[:1500]}"
+		)
+
+	try:
+		media_data = response.json()
+	except ValueError:
+		return None, None, f"media lookup returned non-JSON from {lookup_url}: {response.text[:1500]}"
+	media_url = media_data.get("url")
+	mime_type = media_data.get("mime_type") or media.get("mime_type") or ""
+	file_extension = (mime_type.split("/")[1].split(";")[0] if "/" in mime_type else "bin") or "bin"
+	if not media_url:
+		return None, None, f"media lookup response had no url: {json.dumps(media_data)[:1500]}"
+
+	try:
+		media_response = requests.get(media_url, headers=headers, timeout=60)
+	except requests.RequestException as e:
+		return None, None, f"media download request failed: {media_url[:200]}: {e!r}"
+	if media_response.status_code != 200:
+		return None, None, (
+			f"media download returned HTTP {media_response.status_code} from {media_url[:200]}\n"
+			f"body: {media_response.text[:1500]}"
+		)
+	return media_response.content, file_extension, None
+
 
 def import_history_chunks(chunks, whatsapp_account, business_number):
 	"""Import coexistence history-sync chunks into WhatsApp Message rows.
@@ -433,7 +518,9 @@ def create_echo_message(echo, whatsapp_account):
 		"doctype": "WhatsApp Message",
 		"type": "Outgoing",
 		"via_phone": 1,
-		"to": echo.get("to"),
+		# Username-only recipients have no phone number: Meta sends `to_user_id`
+		# instead of `to`. A missing `to` crashed the profile lookup (None.startswith).
+		"to": echo.get("to") or echo.get("to_user_id"),
 		"message": body,
 		"message_id": echo.get("id"),
 		"content_type": echo_type if echo_type in ("text", "image", "audio", "video", "document", "flow") else "text",
