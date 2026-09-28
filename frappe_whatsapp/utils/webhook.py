@@ -386,6 +386,9 @@ def ingest_incoming_media(message, message_type, insert, reply_to_message_id, is
 		"attached_to_name": doc.name,
 		"content": file_data,
 		"attached_to_field": "attach",
+		# Customer photos are private: served only to logged-in desk users, never at a
+		# guessable public /files/ URL. Matches how outgoing support photos are stored.
+		"is_private": 1,
 	}).save(ignore_permissions=True)
 	doc.db_set("attach", file.file_url)
 
@@ -399,7 +402,10 @@ def download_inbound_media(media, whatsapp_account):
 		return None, None, "payload carried no media id"
 	token = whatsapp_account.get_password("token")
 	headers = {"Authorization": "Bearer " + token}
-	lookup_url = f"{whatsapp_account.url}/{whatsapp_account.version}/{media_id}/"
+	# No trailing slash. Meta's Graph API tolerates one; Dualhook's Graph-compatible
+	# relay returns 404 for `/{media_id}/` and 200 for `/{media_id}` — the slash is why
+	# no inbound media had ever downloaded on relay-backed accounts.
+	lookup_url = f"{whatsapp_account.url}/{whatsapp_account.version}/{media_id}"
 
 	try:
 		response = requests.get(lookup_url, headers=headers, timeout=30)
