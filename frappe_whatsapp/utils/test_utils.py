@@ -27,6 +27,15 @@ class TestFormatNumber(IntegrationTestCase):
     def test_plus_only_at_start(self):
         self.assertEqual(format_number("+1234567890"), "1234567890")
 
+    def test_missing_number_returns_none(self):
+        # Username-only WhatsApp users have no phone number; this used to raise
+        # AttributeError ('NoneType' object has no attribute 'startswith').
+        self.assertIsNone(format_number(None))
+        self.assertIsNone(format_number(""))
+
+    def test_username_identity_passes_through(self):
+        self.assertEqual(format_number("MY.2104627260419460"), "MY.2104627260419460")
+
 
 class TestGetWhatsAppAccount(IntegrationTestCase):
     """Tests for get_whatsapp_account utility."""

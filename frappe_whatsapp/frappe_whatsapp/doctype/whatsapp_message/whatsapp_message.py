@@ -49,6 +49,10 @@ class WhatsAppMessage(Document):
 
     def create_whatsapp_profile(self):
         number = format_number(self.get("from") or self.to)
+        # No identifiable counterparty (e.g. an echo with neither `to` nor
+        # `to_user_id`): record the message, skip the profile, don't abort the insert.
+        if not number:
+            return
         if not frappe.db.exists("WhatsApp Profiles", {"number": number}):
             frappe.get_doc({
                 "doctype": "WhatsApp Profiles",
